@@ -22,3 +22,9 @@ make build-consumer
 ```
 
 Run both applications and watch the tracing information [in Kibana](http://localhost:5601/app/apm/services?rangeFrom=now-15m&rangeTo=now).
+
+Finally, stop the applications and remove the containers
+
+```shell
+docker-compose down
+```
