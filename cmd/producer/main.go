@@ -1,10 +1,11 @@
 package main
 
 import (
-	"bytes"
-	"encoding/gob"
+	"context"
 	"fmt"
-	"github.com/Shopify/sarama"
+	"github.com/segmentio/kafka-go"
+	"go.elastic.co/apm/module/apmhttp/v2"
+	"go.elastic.co/apm/v2"
 	"log"
 	"os"
 	"os/signal"
@@ -13,42 +14,67 @@ import (
 )
 
 func main() {
-	producer, err := sarama.NewAsyncProducer([]string{"localhost:9092"}, nil)
-	if err != nil {
-		panic(err)
-	}
+	ctx, cancel := context.WithCancel(context.Background())
 
-	defer func() {
-		if err := producer.Close(); err != nil {
-			log.Fatalln(err)
-		}
-	}()
+	producers := 1
+
+	for i := 0; i < producers; i++ {
+		go startProducing(ctx, i)
+	}
 
 	// Trap SIGINT to trigger a shutdown.
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGKILL, syscall.SIGINT, syscall.SIGHUP)
 
-	var enqueued, producerErrors int
-ProducerLoop:
-	for {
-		var buf bytes.Buffer
-		gob.NewEncoder(&buf).Encode(map[string]string{"hello": "world"})
-		msg := &sarama.ProducerMessage{
-			Topic: "my_topic",
-			Key:   sarama.StringEncoder(fmt.Sprintf("msg-%d", enqueued)),
-			Value: sarama.ByteEncoder(buf.Bytes()),
-		}
-		select {
-		case producer.Input() <- msg:
-			enqueued++
-			time.Sleep(250 * time.Millisecond)
-		case err := <-producer.Errors():
-			log.Println("Failed to produce message", err)
-			producerErrors++
-		case <-signals:
-			break ProducerLoop
-		}
+	<-signals
+	cancel()
+}
+
+func startProducing(ctx context.Context, idx int) {
+	tracer, err := apm.NewTracer("producer", "1.0.0")
+	if err != nil {
+		log.Fatalf("could not create tracer: %s", err.Error())
 	}
 
-	log.Printf("Enqueued: %d; errors: %d\n", enqueued, producerErrors)
+	log.Printf("Start producer %d", idx)
+	w := &kafka.Writer{
+		Addr:                   kafka.TCP("localhost:9092"),
+		Topic:                  "kafka-go",
+		AllowAutoTopicCreation: true,
+	}
+	defer w.Close()
+
+	msg := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			tx := tracer.StartTransaction("producing", "scheduled")
+			tp := apmhttp.FormatTraceparentHeader(tx.TraceContext())
+
+			err := w.WriteMessages(ctx, kafka.Message{
+				Key: []byte(fmt.Sprintf("producer-%d-msg-%d", idx, msg)),
+				Headers: []kafka.Header{
+					{
+						Key:   "traceparent",
+						Value: []byte(tp),
+					},
+					{
+						Key:   "tracestate",
+						Value: []byte(tx.TraceContext().State.String()),
+					},
+				},
+			})
+			log.Println("trace id: ", tx.TraceContext().Trace)
+			if err != nil {
+				log.Printf("got error while sending from producer %d: %s", idx, err.Error())
+			}
+
+			msg++
+			time.Sleep(2 * time.Second)
+			tx.Result = "success"
+			tx.End()
+		}
+	}
 }
