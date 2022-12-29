@@ -4,13 +4,11 @@ import (
 	"context"
 	"fmt"
 	"github.com/segmentio/kafka-go"
-	"go.elastic.co/apm/module/apmhttp/v2"
 	"go.elastic.co/apm/v2"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 )
 
 func main() {
@@ -29,6 +27,8 @@ func main() {
 	<-signals
 	cancel()
 }
+
+var txResults = []string{"success", "failure"}
 
 func startProducing(ctx context.Context, idx int) {
 	tracer, err := apm.NewTracer("producer", "1.0.0")
@@ -51,30 +51,37 @@ func startProducing(ctx context.Context, idx int) {
 			return
 		default:
 			tx := tracer.StartTransaction("producing", "scheduled")
-			tp := apmhttp.FormatTraceparentHeader(tx.TraceContext())
+			ctx = apm.ContextWithTransaction(ctx, tx)
 
-			err := w.WriteMessages(ctx, kafka.Message{
-				Key: []byte(fmt.Sprintf("producer-%d-msg-%d", idx, msg)),
-				Headers: []kafka.Header{
-					{
-						Key:   "traceparent",
-						Value: []byte(tp),
-					},
-					{
-						Key:   "tracestate",
-						Value: []byte(tx.TraceContext().State.String()),
-					},
-				},
+			kafkaHeaders, err := apmTraceHeaders(ctx)
+			if err != nil {
+				log.Printf("could not extract apm trace headers: %s", err.Error())
+			}
+
+			err = w.WriteMessages(ctx, kafka.Message{
+				Key:     []byte(fmt.Sprintf("producer-%d-msg-%d", idx, msg)),
+				Headers: kafkaHeaders,
 			})
-			log.Println("trace id: ", tx.TraceContext().Trace)
 			if err != nil {
 				log.Printf("got error while sending from producer %d: %s", idx, err.Error())
 			}
 
 			msg++
-			time.Sleep(2 * time.Second)
-			tx.Result = "success"
+			tx.Result = txResults[msg%2]
 			tx.End()
 		}
 	}
+}
+
+func apmTraceHeaders(ctx context.Context) ([]kafka.Header, error) {
+	headers, err := TraceHeaders(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	kafkaHeaders := make([]kafka.Header, len(headers))
+	for _, header := range headers {
+		kafkaHeaders = append(kafkaHeaders, kafka.Header(header))
+	}
+	return kafkaHeaders, nil
 }
